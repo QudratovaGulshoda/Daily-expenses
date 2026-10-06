@@ -127,7 +127,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        HELP_TEXT + f"\n\n<i>Sizning Telegram ID: <code>{update.effective_user.id}</code></i>"
+        HELP_TEXT
     )
     if not db.list_cards(update.effective_user.id):
         await update.message.reply_text("Boshlash uchun /karta ni bosing va kartalaringizni yozing 👇")
@@ -463,8 +463,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Bu xarajat allaqachon saqlangan yoki eskirgan.")
             await query.edit_message_reply_markup(None)
             return
+        card_id = None
+        if card != "cash":
+            # Tugmadagi karta shu foydalanuvchiniki ekanini tekshiramiz (boshqaning kartasiga yozib bo'lmasin)
+            card_id = int(card) if card.isdigit() else -1
+            if card_id not in {c["id"] for c in db.list_cards(user_id)}:
+                await query.answer("Bu karta topilmadi.")
+                return
         await query.answer()
-        await finalize(context, user_id, query.message.chat_id, pid, None if card == "cash" else int(card))
+        await finalize(context, user_id, query.message.chat_id, pid, card_id)
 
     elif action == "cancel":
         context.user_data.get("pending", {}).pop(rest, None)

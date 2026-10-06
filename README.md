@@ -1,6 +1,6 @@
 # Xarajatlar hisob-kitobi — Telegram bot
 
-Kundalik xarajatlarni yozib boradi, qaysi kartadan to'langanini so'raydi, chekni o'qiydi
+Kundalik xarajatlarni yozib boradi (har bir foydalanuvchining ma'lumoti alohida), qaysi kartadan to'langanini so'raydi, chekni o'qiydi
 va har yakshanba haftalik hisobot yuboradi.
 
 ## Qanday ishlaydi
@@ -16,8 +16,8 @@ va har yakshanba haftalik hisobot yuboradi.
    nusxalang (`...pooler.supabase.com:6543/postgres`), `[YOUR-PASSWORD]` o'rniga loyiha parolini yozing.
    Jadvallarni bot o'zi yaratadi.
 2. **Vercel:** shu repo'ni import qiling va Settings → Environment Variables ga kiriting:
-   `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, `CRON_SECRET`, `ALLOWED_USER_IDS`
-   (ixtiyoriy: `ANTHROPIC_API_KEY`). `WEBHOOK_SECRET` va `CRON_SECRET` — istalgan uzun tasodifiy qator.
+   `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, `CRON_SECRET`
+   (ixtiyoriy: `ANTHROPIC_API_KEY`, `ALLOWED_USER_IDS` — botni faqat ma'lum odamlarga cheklash uchun). `WEBHOOK_SECRET` va `CRON_SECRET` — istalgan uzun tasodifiy qator.
 3. **Telegramni Vercel'ga ulash** (kompyuterda, bir marta; `.env` da yuqoridagi qiymatlar bo'lsin):
 
 ```bash
