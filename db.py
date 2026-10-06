@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS sent_reports (
     period  TEXT   NOT NULL,
     PRIMARY KEY (user_id, period)
 );
+-- Supabase jadvallarni ochiq REST API orqali ham ko'rsatadi. RLS yoqilib, qoida qo'shilmasa,
+-- API orqali kirish yopiladi; bot esa jadval egasi sifatida to'g'ridan-to'g'ri ulanadi.
+ALTER TABLE cards        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expenses     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_state   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sent_reports ENABLE ROW LEVEL SECURITY;
 """
 
 _conn: psycopg.Connection | None = None

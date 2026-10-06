@@ -12,7 +12,7 @@ va har yakshanba haftalik hisobot yuboradi.
 
 ## O'rnatish (Vercel + Supabase)
 
-1. **Supabase:** yangi loyiha (region: Frankfurt) → **Connect** → **Transaction pooler** manzilini
+1. **Supabase:** yangi loyiha → **Connect** → **Transaction pooler** manzilini
    nusxalang (`...pooler.supabase.com:6543/postgres`), `[YOUR-PASSWORD]` o'rniga loyiha parolini yozing.
    Jadvallarni bot o'zi yaratadi.
 2. **Vercel:** shu repo'ni import qiling va Settings → Environment Variables ga kiriting:
@@ -64,7 +64,7 @@ xabarni bot chatdan o'chiradi. To'liq karta raqamini saqlash xavfli va hisob-kit
 - `app.py` — Vercel kirish nuqtasi: webhook va kunlik cron
 - `bot.py` — Telegram handlerlar (kompyuterda `python bot.py` bilan polling rejimida ham ishlaydi)
 - `setup_webhook.py` — Telegramga Vercel manzilini berish (bir marta)
-- `vercel.json` — region (Frankfurt) va cron
+- `vercel.json` — region (Supabase bilan bir joyda: Seul, `icn1`) va cron
 - `parser.py` — matndan summa / izoh / karta raqamini ajratish
 - `soliq.py` — QR-kodni o'qish; ixtiyoriy ravishda soliq.uz dan chek ma'lumotini olish
 - `receipt.py` — QR'siz cheklarni Claude orqali o'qish (ixtiyoriy, pullik)
