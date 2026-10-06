@@ -32,9 +32,10 @@ webhook'ni o'chirib qo'yadi — keyin `setup_webhook.py` ni qayta ishga tushirin
 
 | Nima qilasiz | Misol |
 |---|---|
-| Kartalarni qo'shish | `/karta`, keyin har qatorga bitta: `Humo Kapitalbank 9860 1234 5678 9012` |
+| Ism-familiya | Birinchi `/start` da so'raladi, `/ism` bilan o'zgartiriladi |
+| Kartalarni qo'shish | `/karta`, keyin har qatorga bitta: `Humo Kapitalbank 9860 1234 5678 9012` (oxirgi 4 raqami bir xil kartalar nomi bilan ajratiladi) |
 | Xarajat yozish | `Polene sumka 500000`, `Polene sumka 500 ming`, `Taksi 25k`, `kecha telefon 1 mln 200 ming` |
-| Kartani tanlash | Tugmani bosing yoki oxirgi 4 raqamni yozing (`9012`), naqd bo'lsa `naqd` |
+| Kartani tanlash | Tugmani bosing yoki oxirgi 4 raqamni yozing (`9012`); shunday kartalar bir nechta bo'lsa bot qaysi biri ekanini so'raydi. Naqd bo'lsa `naqd` |
 | Chek | Chek rasmini yuboring — QR-koddan sana olinadi, summani o'zingiz yozasiz |
 | Hisobotlar | `/bugun`, `/hafta`, `/oy` |
 | Tahrirlash | `/oxirgi` — oxirgi 10 ta, 🗑 bilan o'chirish |
@@ -53,6 +54,12 @@ Ixtiyoriy sozlamalar (`.env` da):
 - `ANTHROPIC_API_KEY=...` — QR-kodsiz cheklar (Payme/Click skrinshotlari, PDF) Claude orqali o'qiladi (pullik).
 
 Fiskal chekda karta raqami bo'lmaydi, shuning uchun bot qaysi kartadan to'langanini baribir so'raydi.
+
+## Supabase'da ko'rish
+
+- `users` — Telegram ID, ism-familiya, Telegram username
+- `cards` — kartalar (nomi, oxirgi 4 raqami, egasining ism-familiyasi)
+- `xarajatlar` (view) — hamma xarajatlar ism-familiya va karta bilan birga
 
 ## Xavfsizlik
 

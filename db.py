@@ -13,14 +13,29 @@ log = logging.getLogger("hisob-bot.db")
 # spent_at matn ko'rinishida ('YYYY-MM-DD HH:MM') saqlanadi va COLLATE "C" bilan solishtiriladi,
 # aks holda til qoidalariga ko'ra saralash sana oralig'ini buzadi.
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS cards (
-    id         BIGSERIAL PRIMARY KEY,
-    user_id    BIGINT NOT NULL,
-    name       TEXT   NOT NULL,
-    last4      TEXT   NOT NULL,
-    created_at TEXT   NOT NULL,
-    UNIQUE (user_id, last4)
+-- Foydalanuvchilar: Telegram ID va ism-familiya
+CREATE TABLE IF NOT EXISTS users (
+    user_id     BIGINT PRIMARY KEY,
+    full_name   TEXT,               -- foydalanuvchi o'zi yozgan ism-familiya
+    tg_name     TEXT,               -- Telegram profilidagi ism
+    tg_username TEXT,
+    created_at  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cards (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     BIGINT NOT NULL,
+    name        TEXT   NOT NULL,
+    last4       TEXT   NOT NULL,
+    holder_name TEXT,               -- karta egasining ism-familiyasi
+    created_at  TEXT   NOT NULL
+);
+-- Oldingi versiyada (user_id, last4) takrorlanmas edi; turli kartalarning oxirgi 4 raqami bir xil bo'lishi mumkin
+ALTER TABLE cards DROP CONSTRAINT IF EXISTS cards_user_id_last4_key;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS holder_name TEXT;
+-- O'chirilgan karta yashiriladi, lekin eski xarajatlarda nomi ko'rinib turadi
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_cards_user_last4 ON cards (user_id, last4);
 CREATE TABLE IF NOT EXISTS expenses (
     id          BIGSERIAL PRIMARY KEY,
     user_id     BIGINT NOT NULL,
@@ -45,10 +60,18 @@ CREATE TABLE IF NOT EXISTS sent_reports (
 );
 -- Supabase jadvallarni ochiq REST API orqali ham ko'rsatadi. RLS yoqilib, qoida qo'shilmasa,
 -- API orqali kirish yopiladi; bot esa jadval egasi sifatida to'g'ridan-to'g'ri ulanadi.
+ALTER TABLE users        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cards        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expenses     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_state   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sent_reports ENABLE ROW LEVEL SECURITY;
+-- Supabase Table Editor'da qulay ko'rish uchun: xarajatlar ism-familiya va karta bilan
+CREATE OR REPLACE VIEW xarajatlar WITH (security_invoker = true) AS
+SELECT e.id, e.user_id, u.full_name, e.spent_at, e.description, e.amount,
+       c.name AS karta, c.last4, c.holder_name AS karta_egasi, e.source
+FROM expenses e
+LEFT JOIN users u ON u.user_id = e.user_id
+LEFT JOIN cards c ON c.id = e.card_id;
 """
 
 _conn: psycopg.Connection | None = None
@@ -96,31 +119,88 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+# --- Foydalanuvchilar ---
+
+def touch_user(user_id: int, tg_name: str, tg_username: str | None) -> None:
+    """Har bir xabarda Telegram profilini yangilaydi (birinchi marta bo'lsa yaratadi)."""
+    now = _now()
+    _execute(
+        "INSERT INTO users (user_id, tg_name, tg_username, created_at, last_seen)"
+        " VALUES (%s, %s, %s, %s, %s)"
+        " ON CONFLICT (user_id) DO UPDATE SET tg_name = EXCLUDED.tg_name,"
+        " tg_username = EXCLUDED.tg_username, last_seen = EXCLUDED.last_seen",
+        (user_id, tg_name, tg_username, now, now),
+    )
+
+
+def get_full_name(user_id: int) -> str | None:
+    row = _execute("SELECT full_name FROM users WHERE user_id = %s", (user_id,)).fetchone()
+    return row["full_name"] if row else None
+
+
+def set_full_name(user_id: int, full_name: str) -> None:
+    """Ism-familiyani saqlaydi va egasi yozilmagan kartalarga ham qo'yadi."""
+    now = _now()
+    _execute(
+        "INSERT INTO users (user_id, full_name, created_at, last_seen) VALUES (%s, %s, %s, %s)"
+        " ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name",
+        (user_id, full_name, now, now),
+    )
+    _execute(
+        "UPDATE cards SET holder_name = %s WHERE user_id = %s AND holder_name IS NULL",
+        (full_name, user_id),
+    )
+
+
 # --- Kartalar ---
 
-def add_card(user_id: int, name: str, last4: str) -> bool:
-    """Yangi karta qo'shadi. Shu oxirgi 4 raqamli karta bo'lsa nomini yangilaydi va False qaytaradi."""
-    row = _execute(
-        "INSERT INTO cards (user_id, name, last4, created_at) VALUES (%s, %s, %s, %s)"
-        " ON CONFLICT (user_id, last4) DO UPDATE SET name = EXCLUDED.name"
-        " RETURNING (xmax = 0) AS inserted",
-        (user_id, name, last4, _now()),
+def add_card(user_id: int, name: str, last4: str, holder_name: str | None) -> bool:
+    """Karta qo'shadi. Xuddi shu nom va oxirgi 4 raqamli karta bo'lsa, yangisini qo'shmaydi (False).
+
+    Oxirgi 4 raqami bir xil, lekin nomi boshqa kartalar alohida saqlanadi.
+    """
+    existing = _execute(
+        "SELECT id, deleted_at FROM cards WHERE user_id = %s AND last4 = %s AND lower(name) = lower(%s)",
+        (user_id, last4, name),
     ).fetchone()
-    return row["inserted"]
+    if existing:
+        _execute(
+            "UPDATE cards SET holder_name = COALESCE(%s, holder_name), deleted_at = NULL WHERE id = %s",
+            (holder_name, existing["id"]),
+        )
+        return existing["deleted_at"] is not None  # o'chirilgan karta qaytarilsa — yangi deb hisoblanadi
+    _execute(
+        "INSERT INTO cards (user_id, name, last4, holder_name, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, name, last4, holder_name, _now()),
+    )
+    return True
 
 
 def list_cards(user_id: int) -> list[dict]:
-    return _execute("SELECT * FROM cards WHERE user_id = %s ORDER BY id", (user_id,)).fetchall()
-
-
-def find_card(user_id: int, last4: str) -> dict | None:
     return _execute(
-        "SELECT * FROM cards WHERE user_id = %s AND last4 = %s", (user_id, last4)
+        "SELECT * FROM cards WHERE user_id = %s AND deleted_at IS NULL ORDER BY id", (user_id,)
+    ).fetchall()
+
+
+def find_cards(user_id: int, last4: str) -> list[dict]:
+    """Oxirgi 4 raqami mos keladigan hamma kartalar (bir nechta bo'lishi mumkin)."""
+    return _execute(
+        "SELECT * FROM cards WHERE user_id = %s AND last4 = %s AND deleted_at IS NULL ORDER BY id",
+        (user_id, last4),
+    ).fetchall()
+
+
+def get_card(user_id: int, card_id: int) -> dict | None:
+    return _execute(
+        "SELECT * FROM cards WHERE user_id = %s AND id = %s AND deleted_at IS NULL", (user_id, card_id)
     ).fetchone()
 
 
-def delete_card(user_id: int, last4: str) -> bool:
-    cur = _execute("DELETE FROM cards WHERE user_id = %s AND last4 = %s", (user_id, last4))
+def delete_card(user_id: int, card_id: int) -> bool:
+    cur = _execute(
+        "UPDATE cards SET deleted_at = %s WHERE user_id = %s AND id = %s AND deleted_at IS NULL",
+        (_now(), user_id, card_id),
+    )
     return cur.rowcount > 0
 
 
@@ -143,7 +223,7 @@ def delete_expense(user_id: int, expense_id: int) -> bool:
 
 
 _EXPENSE_SELECT = (
-    "SELECT e.*, c.name AS card_name, c.last4 AS card_last4"
+    "SELECT e.*, c.name AS card_name, c.last4 AS card_last4, c.deleted_at AS card_deleted_at"
     " FROM expenses e LEFT JOIN cards c ON c.id = e.card_id"
 )
 

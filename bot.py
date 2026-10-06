@@ -6,6 +6,7 @@ import html
 import io
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -80,6 +81,7 @@ QR-kod aniq ko'rinsin (yaqinroqdan, tekis qilib rasmga oling).
 /kartalar — kartalar ro'yxati
 /karta — karta qo'shish
 /karta_ochir 1234 — kartani o'chirish
+/ism — ism-familiyani o'zgartirish
 /export — hamma xarajatlar CSV (Excel) faylda
 
 📬 Har yakshanba kechqurun haftalik hisobot o'zi keladi."""
@@ -98,6 +100,7 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if user and context.user_data is not None:
             context.user_data.clear()
             context.user_data.update(db.load_state(user.id))
+            db.touch_user(user.id, user.full_name, user.username)
         return
     if update.effective_message:
         await update.effective_message.reply_text(
@@ -126,11 +129,59 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --- Umumiy buyruqlar ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        HELP_TEXT
-    )
-    if not db.list_cards(update.effective_user.id):
+    await update.message.reply_text(HELP_TEXT)
+    user_id = update.effective_user.id
+    if not db.get_full_name(user_id):
+        await ask_name(update, context)
+    elif not db.list_cards(user_id):
         await update.message.reply_text("Boshlash uchun /karta ni bosing va kartalaringizni yozing 👇")
+
+
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE, then: str | None = None) -> None:
+    context.user_data["state"] = "ask_name"
+    if then:
+        context.user_data["after_name"] = then
+    await update.message.reply_text(
+        "👤 Ism-familiyangizni yozing (kartalaringiz shu nomga yoziladi):\n"
+        "<code>Gulshoda Qudratova</code>"
+    )
+
+
+async def name_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    current = db.get_full_name(update.effective_user.id)
+    if current:
+        await update.message.reply_text(f"Hozirgi ism-familiyangiz: <b>{html.escape(current)}</b>")
+    await ask_name(update, context)
+
+
+_NAME_WORD_RE = re.compile(r"^[^\W\d_]+(?:[ʻʼ'’`-][^\W\d_]+)*\.?$")
+
+
+def normalize_full_name(text: str) -> str | None:
+    """'gulshoda qudratova' -> 'Gulshoda Qudratova'. Kamida 2 so'z, raqamsiz bo'lishi kerak."""
+    words = text.split()
+    if not 2 <= len(words) <= 4 or len(text) > 60:
+        return None
+    if not all(_NAME_WORD_RE.match(w) for w in words):
+        return None
+    return " ".join(w[0].upper() + w[1:] for w in words)
+
+
+async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    full_name = normalize_full_name(text)
+    if not full_name:
+        await update.message.reply_text(
+            "Ism va familiyani harflar bilan, bo'sh joy bilan ajratib yozing, masalan: "
+            "<code>Gulshoda Qudratova</code>"
+        )
+        return
+    user_id = update.effective_user.id
+    db.set_full_name(user_id, full_name)
+    context.user_data.pop("state", None)
+    after = context.user_data.pop("after_name", None)
+    await update.message.reply_text(f"✅ Saqlandi: <b>{html.escape(full_name)}</b>")
+    if after == "add_card" or not db.list_cards(user_id):
+        await prompt_cards(update, context)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -140,22 +191,31 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --- Kartalar ---
 
 async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not db.get_full_name(update.effective_user.id):
+        await ask_name(update, context, then="add_card")
+        return
     text = update.message.text.partition(" ")[2].strip()
     if text:
         await save_cards(update, context, text)
         return
+    await prompt_cards(update, context)
+
+
+async def prompt_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["state"] = "add_card"
     await update.message.reply_text(
         "Kartalaringizni yozing — har birini alohida qatorda, nomi va raqami bilan:\n\n"
         "<code>Humo Kapitalbank 9860 1234 5678 9012\n"
         "Uzcard Asaka 8600 1111 2222 3333</code>\n\n"
-        "To'liq raqam o'rniga faqat oxirgi 4 raqamni yozsangiz ham bo'ladi: <code>Humo 9012</code>"
+        "To'liq raqam o'rniga faqat oxirgi 4 raqamni yozsangiz ham bo'ladi: <code>Humo 9012</code>\n"
+        "Oxirgi 4 raqami bir xil kartalarni nomi bilan ajrating: <code>Humo 1234</code>, <code>Uzcard 1234</code>"
     )
 
 
 async def save_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     user_id = update.effective_user.id
     context.user_data.pop("state", None)
+    holder = db.get_full_name(user_id)
     saved, bad = [], []
     for line in filter(None, (l.strip() for l in text.splitlines())):
         parsed = parse_card_line(line)
@@ -163,8 +223,8 @@ async def save_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
             bad.append(line)
             continue
         name, last4, _ = parsed
-        is_new = db.add_card(user_id, name, last4)
-        saved.append(f"{'➕' if is_new else '✏️'} {html.escape(name)} •••• {last4}")
+        is_new = db.add_card(user_id, name, last4, holder)
+        saved.append(f"{'➕' if is_new else '♻️ (oldin bor edi)'} {html.escape(name)} •••• {last4}")
 
     if contains_full_card_number(text):
         try:
@@ -174,7 +234,7 @@ async def save_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
 
     lines = []
     if saved:
-        lines.append("✅ Saqlandi:\n" + "\n".join(saved))
+        lines.append(f"✅ Saqlandi ({html.escape(holder or '')}):\n" + "\n".join(saved))
     if bad:
         lines.append("⚠️ Bu qatorlarda karta raqami topilmadi:\n" + "\n".join(html.escape(b) for b in bad))
         context.user_data["state"] = "add_card"
@@ -195,7 +255,8 @@ async def cards_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     spent: dict[int | None, int] = {}
     for r in month_rows:
         spent[r["card_id"]] = spent.get(r["card_id"], 0) + r["amount"]
-    lines = ["💳 <b>Kartalaringiz</b> (shu oydagi xarajat):", ""]
+    holder = db.get_full_name(user_id)
+    lines = [f"💳 <b>Kartalaringiz</b>{' — ' + html.escape(holder) if holder else ''} (shu oydagi xarajat):", ""]
     for c in cards:
         lines.append(f"• {html.escape(c['name'])} •••• {c['last4']} — {format_sum(spent.get(c['id'], 0))}")
     if spent.get(None):
@@ -207,12 +268,23 @@ async def card_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not context.args or not context.args[0].isdigit() or len(context.args[0]) != 4:
         await update.message.reply_text("Oxirgi 4 raqamni yozing: <code>/karta_ochir 1234</code>")
         return
-    if db.delete_card(update.effective_user.id, context.args[0]):
+    cards = db.find_cards(update.effective_user.id, context.args[0])
+    if not cards:
+        await update.message.reply_text("Bunday karta topilmadi.")
+    elif len(cards) == 1:
+        db.delete_card(update.effective_user.id, cards[0]["id"])
         await update.message.reply_text(
-            f"🗑 •••• {context.args[0]} karta o'chirildi. Unga yozilgan xarajatlar saqlanib qoladi."
+            f"🗑 {html.escape(cards[0]['name'])} •••• {cards[0]['last4']} o'chirildi. "
+            "Unga yozilgan xarajatlar saqlanib qoladi."
         )
     else:
-        await update.message.reply_text("Bunday karta topilmadi.")
+        await update.message.reply_text(
+            f"•••• {context.args[0]} bilan {len(cards)} ta karta bor. Qaysi birini o'chiray?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🗑 {c['name']} •{c['last4']}", callback_data=f"delcard:{c['id']}")]
+                for c in cards
+            ]),
+        )
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -283,7 +355,7 @@ async def finalize(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: in
 
     card_text = "💵 Naqd"
     if card_id is not None:
-        card = next((c for c in db.list_cards(user_id) if c["id"] == card_id), None)
+        card = db.get_card(user_id, card_id)
         if card is not None:
             card_text = f"💳 {html.escape(card['name'])} •{card['last4']}"
 
@@ -300,6 +372,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     user_id = update.effective_user.id
 
+    if context.user_data.get("state") == "ask_name":
+        await save_name(update, context, text)
+        return
     if context.user_data.get("state") == "add_card":
         await save_cards(update, context, text)
         return
@@ -308,13 +383,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     last_pid = context.user_data.get("last_pending")
     if last_pid and last_pid in context.user_data.get("pending", {}):
         if text.isdigit() and len(text) == 4:
-            card = db.find_card(user_id, text)
-            if card is None:
+            cards = db.find_cards(user_id, text)
+            if not cards:
                 await update.message.reply_text(
                     f"•••• {text} karta topilmadi. Tugmalardan birini tanlang yoki /karta orqali qo'shing."
                 )
-                return
-            await finalize(context, user_id, update.effective_chat.id, last_pid, card["id"])
+            elif len(cards) == 1:
+                await finalize(context, user_id, update.effective_chat.id, last_pid, cards[0]["id"])
+            else:
+                await update.message.reply_text(
+                    f"•••• {text} bilan {len(cards)} ta karta bor. Qaysi biri?",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"{c['name']} •{c['last4']}", callback_data=f"card:{last_pid}:{c['id']}")
+                        for c in cards
+                    ]]),
+                )
             return
         if text.lower() in ("naqd", "naqd pul", "нақд", "наличные"):
             await finalize(context, user_id, update.effective_chat.id, last_pid, None)
@@ -360,9 +443,11 @@ def receipt_pending(user_id: int, amount: int, description: str, spent: datetime
 
     suggested = None
     if len(card_last4) == 4:
-        card = db.find_card(user_id, card_last4)
-        if card:
-            suggested = card["id"]
+        cards = db.find_cards(user_id, card_last4)
+        if len(cards) == 1:
+            suggested = cards[0]["id"]
+        elif cards:
+            extra.append(f"💳 Chekdagi •••• {card_last4} bilan {len(cards)} ta kartangiz bor — tanlang.")
         else:
             extra.append(f"⚠️ Chekdagi karta •••• {card_last4} bazada yo'q.")
 
@@ -467,11 +552,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if card != "cash":
             # Tugmadagi karta shu foydalanuvchiniki ekanini tekshiramiz (boshqaning kartasiga yozib bo'lmasin)
             card_id = int(card) if card.isdigit() else -1
-            if card_id not in {c["id"] for c in db.list_cards(user_id)}:
+            if db.get_card(user_id, card_id) is None:
                 await query.answer("Bu karta topilmadi.")
                 return
         await query.answer()
         await finalize(context, user_id, query.message.chat_id, pid, card_id)
+
+    elif action == "delcard":
+        card = db.get_card(user_id, int(rest)) if rest.isdigit() else None
+        if card and db.delete_card(user_id, card["id"]):
+            await query.answer("O'chirildi")
+            await query.edit_message_text(
+                f"🗑 {html.escape(card['name'])} •••• {card['last4']} o'chirildi. "
+                "Unga yozilgan xarajatlar saqlanib qoladi."
+            )
+        else:
+            await query.answer("Karta topilmadi")
 
     elif action == "cancel":
         context.user_data.get("pending", {}).pop(rest, None)
@@ -576,6 +672,7 @@ BOT_COMMANDS = [
     BotCommand("kartalar", "Kartalar ro'yxati"),
     BotCommand("karta", "Karta qo'shish"),
     BotCommand("export", "CSV (Excel) faylga yuklab olish"),
+    BotCommand("ism", "Ism-familiyani o'zgartirish"),
     BotCommand("yordam", "Qo'llanma"),
 ]
 
@@ -603,6 +700,7 @@ def build_application(**builder_options) -> Application:
     app.add_handler(CommandHandler("karta", card_cmd))
     app.add_handler(CommandHandler("kartalar", cards_list))
     app.add_handler(CommandHandler("karta_ochir", card_delete_cmd))
+    app.add_handler(CommandHandler("ism", name_cmd))
     app.add_handler(CommandHandler("bekor", cancel_cmd))
     app.add_handler(CommandHandler("bugun", today_cmd))
     app.add_handler(CommandHandler("hafta", week_cmd))

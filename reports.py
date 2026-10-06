@@ -11,11 +11,10 @@ WEEKDAYS = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
 
 
 def card_label(row) -> str:
-    if row["card_last4"]:
-        return f"{row['card_name']} •{row['card_last4']}"
     if row["card_id"] is None:
         return "Naqd"
-    return "O'chirilgan karta"
+    label = f"{row['card_name']} •{row['card_last4']}"
+    return label + " (o'chirilgan)" if row.get("card_deleted_at") else label
 
 
 def _range_str(d: date) -> str:
