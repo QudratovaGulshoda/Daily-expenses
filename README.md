@@ -38,8 +38,35 @@ webhook'ni o'chirib qo'yadi — keyin `setup_webhook.py` ni qayta ishga tushirin
 | Kartani tanlash | Tugmani bosing yoki oxirgi 4 raqamni yozing (`9012`); shunday kartalar bir nechta bo'lsa bot qaysi biri ekanini so'raydi. Naqd bo'lsa `naqd` |
 | Chek | Chek rasmini yuboring — QR-koddan sana olinadi, summani o'zingiz yozasiz |
 | Hisobotlar | `/bugun`, `/hafta`, `/oy` |
-| Tahrirlash | `/oxirgi` — oxirgi 10 ta, 🗑 bilan o'chirish |
+| Tahrirlash | Saqlangandan keyin "↩️ Bekor qilish" tugmasi; `/oxirgi` — oxirgi 10 ta, 🗑 bilan o'chirish |
+| Qidiruv | `/qidir sumka`, `/qidir Korzinka`, `/qidir qora` — topilganlar va jami summa |
+| Oylik limit | `/limit 3 mln` — 80% va 100% ga yetganda ogohlantiradi; `/limit 0` — o'chirish |
 | Excel | `/export` — CSV fayl |
+
+## Xarajat matni qanday tahlil qilinadi
+
+`qora polen sumka korobkasi bn 500 ming` →
+
+| Ustun | Qiymat |
+|---|---|
+| description (tuzatilgan izoh) | qora Polene sumka korobkasi bilan |
+| item_name (nomi) | Polene sumka |
+| item_type (nimaligi) | sumka |
+| brand | Polene |
+| color | qora |
+| has_box (korobka) | true |
+| category | Aksessuarlar |
+| raw_text (asl matn) | qora polen sumka korobkasi bn 500 ming |
+
+Standart holatda bu `enrich.py` dagi lug'atlar bo'yicha bajariladi (tekin, internetsiz): ma'lum
+buyumlar, brendlar va ranglarga o'xshash xato yozilgan so'zlar tuzatiladi. Lug'atda yo'q brend yoki
+buyum bo'lsa, ustun bo'sh qoladi — yangi so'zlarni `ITEMS`, `BRANDS`, `COLORS` ga qo'shish mumkin.
+`ANTHROPIC_API_KEY` berilsa, tahlil Claude orqali qilinadi (aniqroq, pullik).
+
+## Avtomatik hisobotlar
+
+Har kuni 21:00–22:00 (Toshkent) da Vercel Cron `/api/cron/daily` ni chaqiradi:
+yakshanba — haftalik hisobot, oyning 1-kuni — o'tgan oy hisoboti (kategoriyalar bilan).
 
 ## Chek qanday o'qiladi
 
@@ -59,7 +86,7 @@ Fiskal chekda karta raqami bo'lmaydi, shuning uchun bot qaysi kartadan to'langan
 
 - `users` — Telegram ID, ism-familiya, Telegram username
 - `cards` — kartalar (nomi, oxirgi 4 raqami, egasining ism-familiyasi)
-- `xarajatlar` (view) — hamma xarajatlar ism-familiya va karta bilan birga
+- `xarajatlar` (view) — hamma xarajatlar ism-familiya, karta, nomi, turi, brendi, rangi, korobkasi va kategoriyasi bilan
 
 ## Xavfsizlik
 
@@ -73,6 +100,7 @@ xabarni bot chatdan o'chiradi. To'liq karta raqamini saqlash xavfli va hisob-kit
 - `setup_webhook.py` — Telegramga Vercel manzilini berish (bir marta)
 - `vercel.json` — region (Supabase bilan bir joyda: Seul, `icn1`) va cron
 - `parser.py` — matndan summa / izoh / karta raqamini ajratish
+- `enrich.py` — imlo tuzatish; nomi, turi, brendi, rangi, korobkasi, kategoriyasini ajratish
 - `soliq.py` — QR-kodni o'qish; ixtiyoriy ravishda soliq.uz dan chek ma'lumotini olish
 - `receipt.py` — QR'siz cheklarni Claude orqali o'qish (ixtiyoriy, pullik)
 - `reports.py` — kunlik / haftalik / oylik hisobotlar

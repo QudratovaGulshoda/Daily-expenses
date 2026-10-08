@@ -42,7 +42,8 @@ def build_report(
     lines.append(f"💰 Jami: <b>{format_sum(total)}</b> ({len(rows)} ta xarajat)")
 
     days = (end - start).days + 1
-    prev_end = prev_start + timedelta(days=days - 1)
+    # oylar uzunligi har xil: oldingi davr joriy davrga kirib ketmasin
+    prev_end = min(prev_start + timedelta(days=days - 1), start - timedelta(days=1))
     prev_rows = db.expenses_between(
         user_id, _range_str(prev_start), _range_str(prev_end + timedelta(days=1))
     )
@@ -58,6 +59,14 @@ def build_report(
     lines += ["", "💳 <b>Kartalar bo'yicha:</b>"]
     for label, amount in sorted(by_card.items(), key=lambda x: -x[1]):
         lines.append(f"  • {html.escape(label)}: {format_sum(amount)} ({amount / total * 100:.0f}%)")
+
+    by_category: dict[str, int] = defaultdict(int)
+    for r in rows:
+        by_category[r.get("category") or "Boshqa"] += r["amount"]
+    if len(by_category) > 1 or "Boshqa" not in by_category:
+        lines += ["", "🗂 <b>Kategoriyalar bo'yicha:</b>"]
+        for name, amount in sorted(by_category.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {html.escape(name)}: {format_sum(amount)} ({amount / total * 100:.0f}%)")
 
     if days > 1:
         by_day: dict[str, int] = defaultdict(int)
@@ -106,4 +115,14 @@ def month_report(user_id: int, now: datetime) -> str:
     return build_report(
         user_id, first, next_month - timedelta(days=1), "Oylik hisobot", today,
         prev_first, "O'tgan oy",
+    )
+
+
+def previous_month_report(user_id: int, now: datetime) -> str:
+    """O'tgan oyning to'liq hisoboti (har oyning 1-kuni yuboriladi)."""
+    last_day = now.date().replace(day=1) - timedelta(days=1)
+    first = last_day.replace(day=1)
+    prev_first = (first - timedelta(days=1)).replace(day=1)
+    return build_report(
+        user_id, first, last_day, "O'tgan oy hisoboti", last_day, prev_first, "Undan oldingi oy"
     )

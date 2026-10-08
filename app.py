@@ -62,8 +62,6 @@ async def daily_cron(request: Request):
                       "Bearer " + os.getenv("CRON_SECRET", "") if os.getenv("CRON_SECRET") else ""):
         return Response(status_code=401)
     db.ping()  # Supabase tekin loyihasi 7 kun so'rovsiz qolsa uxlab qoladi
-    sent = 0
-    if bot.now().weekday() == 6:  # yakshanba
-        application = await get_application()
-        sent = await bot.send_weekly_reports(application.bot)
-    return {"ok": True, "weekly_reports_sent": sent}
+    application = await get_application()
+    result = await bot.run_daily_tasks(application.bot)  # yakshanba — haftalik, 1-kun — oylik hisobot
+    return {"ok": True, **result}

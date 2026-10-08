@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS expenses (
     created_at  TEXT   NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses (user_id, spent_at);
+-- Xarajat matnidan ajratilgan ma'lumotlar (enrich.py)
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS raw_text  TEXT;     -- foydalanuvchi yozgan asl matn
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS item_name TEXT;     -- nomi, masalan "Polene sumka"
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS item_type TEXT;     -- nimaligi, masalan "sumka"
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS brand     TEXT;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS color     TEXT;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS has_box   BOOLEAN;  -- korobka bilan / korobkasiz / NULL
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS category  TEXT;
+ALTER TABLE users    ADD COLUMN IF NOT EXISTS monthly_limit BIGINT;
 -- Tugma bosilishini kutayotgan xarajatlar va suhbat holati (serverless'da xotira saqlanmaydi)
 CREATE TABLE IF NOT EXISTS user_state (
     user_id BIGINT PRIMARY KEY,
@@ -68,7 +77,10 @@ ALTER TABLE sent_reports ENABLE ROW LEVEL SECURITY;
 -- Supabase Table Editor'da qulay ko'rish uchun: xarajatlar ism-familiya va karta bilan
 CREATE OR REPLACE VIEW xarajatlar WITH (security_invoker = true) AS
 SELECT e.id, e.user_id, u.full_name, e.spent_at, e.description, e.amount,
-       c.name AS karta, c.last4, c.holder_name AS karta_egasi, e.source
+       c.name AS karta, c.last4, c.holder_name AS karta_egasi, e.source,
+       e.item_name AS nomi, e.item_type AS turi, e.brand AS brend, e.color AS rang,
+       CASE e.has_box WHEN true THEN 'bor' WHEN false THEN 'yo''q' END AS korobka,
+       e.category AS kategoriya, e.raw_text AS asl_matn
 FROM expenses e
 LEFT JOIN users u ON u.user_id = e.user_id
 LEFT JOIN cards c ON c.id = e.card_id;
@@ -152,6 +164,28 @@ def set_full_name(user_id: int, full_name: str) -> None:
     )
 
 
+def reset_limit_warnings(user_id: int, month: str) -> None:
+    """Limit o'zgartirilganda shu oy uchun ogohlantirishlar qaytadan yuborilishi uchun."""
+    _execute(
+        "DELETE FROM sent_reports WHERE user_id = %s AND period IN (%s, %s)",
+        (user_id, f"limit80:{month}", f"limit100:{month}"),
+    )
+
+
+def get_monthly_limit(user_id: int) -> int | None:
+    row = _execute("SELECT monthly_limit FROM users WHERE user_id = %s", (user_id,)).fetchone()
+    return row["monthly_limit"] if row else None
+
+
+def set_monthly_limit(user_id: int, amount: int | None) -> None:
+    now = _now()
+    _execute(
+        "INSERT INTO users (user_id, monthly_limit, created_at, last_seen) VALUES (%s, %s, %s, %s)"
+        " ON CONFLICT (user_id) DO UPDATE SET monthly_limit = EXCLUDED.monthly_limit",
+        (user_id, amount, now, now),
+    )
+
+
 # --- Kartalar ---
 
 def add_card(user_id: int, name: str, last4: str, holder_name: str | None) -> bool:
@@ -207,14 +241,50 @@ def delete_card(user_id: int, card_id: int) -> bool:
 # --- Xarajatlar ---
 
 def add_expense(
-    user_id: int, amount: int, description: str, card_id: int | None, spent_at: str, source: str
+    user_id: int, amount: int, description: str, card_id: int | None, spent_at: str, source: str,
+    info: dict | None = None, raw_text: str | None = None,
 ) -> int:
+    """info — enrich.ItemInfo.to_dict(): item_name, item_type, brand, color, has_box, category."""
+    info = info or {}
     row = _execute(
-        "INSERT INTO expenses (user_id, amount, description, card_id, spent_at, source, created_at)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (user_id, amount, description, card_id, spent_at, source, _now()),
+        "INSERT INTO expenses (user_id, amount, description, card_id, spent_at, source, created_at,"
+        " raw_text, item_name, item_type, brand, color, has_box, category)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (user_id, amount, description, card_id, spent_at, source, _now(), raw_text,
+         info.get("item_name"), info.get("item_type"), info.get("brand"), info.get("color"),
+         info.get("has_box"), info.get("category")),
     ).fetchone()
     return row["id"]
+
+
+def search_expenses(user_id: int, query: str, limit: int = 15) -> tuple[list[dict], int, int]:
+    """Izoh, nomi, turi, brendi, rangi yoki kategoriyasida so'z bor xarajatlar.
+
+    Qaytaradi: (oxirgi `limit` ta xarajat, jami soni, jami summasi).
+    """
+    pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    where = (
+        " WHERE e.user_id = %s AND (e.description ILIKE %s OR e.item_name ILIKE %s OR e.item_type ILIKE %s"
+        " OR e.brand ILIKE %s OR e.color ILIKE %s OR e.category ILIKE %s OR e.raw_text ILIKE %s)"
+    )
+    params = (user_id,) + (pattern,) * 7
+    totals = _execute(
+        "SELECT count(*) AS n, coalesce(sum(e.amount), 0) AS total FROM expenses e" + where, params
+    ).fetchone()
+    rows = _execute(
+        _EXPENSE_SELECT + where + " ORDER BY e.spent_at DESC, e.id DESC LIMIT %s", params + (limit,)
+    ).fetchall()
+    return rows, totals["n"], int(totals["total"])
+
+
+def month_total(user_id: int, month: str) -> int:
+    """month — 'YYYY-MM'."""
+    row = _execute(
+        "SELECT coalesce(sum(amount), 0) AS total FROM expenses"
+        " WHERE user_id = %s AND spent_at >= %s AND spent_at < %s",
+        (user_id, month, month + "~"),
+    ).fetchone()
+    return int(row["total"])
 
 
 def delete_expense(user_id: int, expense_id: int) -> bool:

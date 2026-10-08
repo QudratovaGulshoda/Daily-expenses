@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 import db
+import enrich
 import reports
 from parser import contains_full_card_number, format_sum, parse_card_line, parse_expense
 import soliq
@@ -82,9 +83,12 @@ QR-kod aniq ko'rinsin (yaqinroqdan, tekis qilib rasmga oling).
 /karta — karta qo'shish
 /karta_ochir 1234 — kartani o'chirish
 /ism — ism-familiyani o'zgartirish
+/qidir sumka — xarajatlar ichidan qidirish
+/limit 3 mln — oylik limit (80% va 100% da ogohlantiradi)
 /export — hamma xarajatlar CSV (Excel) faylda
 
-📬 Har yakshanba kechqurun haftalik hisobot o'zi keladi."""
+✍️ Imlo xatolari o'zi tuzatiladi; nomi, brendi, rangi, korobkasi va kategoriyasi alohida saqlanadi.
+📬 Har yakshanba kechqurun haftalik, har oyning 1-kuni oylik hisobot o'zi keladi."""
 
 
 def now() -> datetime:
@@ -313,11 +317,30 @@ def card_keyboard(user_id: int, pid: str, suggested_card_id: int | None = None) 
     return InlineKeyboardMarkup(rows)
 
 
+def info_text(info: dict | None) -> str:
+    """'🏷 Polene · 🎨 qora · 📦 korobka bilan · 🗂 Aksessuarlar'"""
+    if not info:
+        return ""
+    parts = []
+    if info.get("brand"):
+        parts.append(f"🏷 {html.escape(info['brand'])}")
+    if info.get("color"):
+        parts.append(f"🎨 {html.escape(info['color'])}")
+    if info.get("has_box") is not None:
+        parts.append("📦 korobka bilan" if info["has_box"] else "📦 korobkasiz")
+    if info.get("category"):
+        parts.append(f"🗂 {html.escape(info['category'])}")
+    return " · ".join(parts)
+
+
 def pending_text(p: dict) -> str:
     text = (
         f"🧾 <b>{html.escape(p['description'])}</b> — {format_sum(p['amount'])}\n"
         f"📅 {p['spent_at'][8:10]}.{p['spent_at'][5:7]}.{p['spent_at'][:4]}"
     )
+    details = info_text(p.get("info"))
+    if details:
+        text += "\n" + details
     if p.get("extra"):
         text += "\n" + p["extra"]
     return text
@@ -349,7 +372,10 @@ async def finalize(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: in
     p = context.user_data.get("pending", {}).pop(pid, None)
     if p is None:
         return
-    db.add_expense(user_id, p["amount"], p["description"], card_id, p["spent_at"], p["source"])
+    expense_id = db.add_expense(
+        user_id, p["amount"], p["description"], card_id, p["spent_at"], p["source"],
+        info=p.get("info"), raw_text=p.get("raw_text"),
+    )
     if context.user_data.get("last_pending") == pid:
         context.user_data.pop("last_pending", None)
 
@@ -362,10 +388,32 @@ async def finalize(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: in
     day = p["spent_at"][:10]
     day_total = sum(r["amount"] for r in db.expenses_between(user_id, day, day + "~"))
     text = f"✅ Saqlandi\n{pending_text(p)}\n{card_text}\n\nShu kun jami: {format_sum(day_total)}"
+    undo = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Bekor qilish", callback_data=f"undo:{expense_id}")]])
     try:
-        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=p["message_id"])
+        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=p["message_id"], reply_markup=undo)
     except TelegramError:
-        await context.bot.send_message(chat_id, text)
+        await context.bot.send_message(chat_id, text, reply_markup=undo)
+    await check_limit(context.bot, user_id, chat_id, p["spent_at"])
+
+
+async def check_limit(bot, user_id: int, chat_id: int, spent_at: str) -> None:
+    """Oylik limitning 80% va 100% iga yetganda bir martadan ogohlantiradi."""
+    limit = db.get_monthly_limit(user_id)
+    month = spent_at[:7]
+    if not limit or month != now().strftime("%Y-%m"):
+        return
+    total = db.month_total(user_id, month)
+    for pct in (100, 80):
+        if total * 100 >= limit * pct:
+            if db.mark_report_sent(user_id, f"limit{pct}:{month}"):
+                if pct == 100:
+                    text = (f"🚨 Oylik limit tugadi! Shu oy {format_sum(total)} sarfladingiz "
+                            f"(limit {format_sum(limit)}, {format_sum(total - limit)} ortiqcha).")
+                else:
+                    text = (f"⚠️ Oylik limitning {total * 100 // limit}% i ishlatildi: "
+                            f"{format_sum(total)} / {format_sum(limit)}. Qoldi: {format_sum(limit - total)}.")
+                await bot.send_message(chat_id, text)
+            break
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -420,9 +468,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     receipt_spent_at = context.user_data.pop("receipt_spent_at", None)
     spent = now() - timedelta(days=parsed.days_ago)
+    info = await enrich.enrich(parsed.description)
     await ask_card(update, context, {
         "amount": parsed.amount,
-        "description": parsed.description,
+        "description": info.description,
+        "raw_text": text,
+        "info": info.to_dict(),
         "spent_at": receipt_spent_at or spent.strftime("%Y-%m-%d %H:%M"),
         "source": "receipt" if receipt_spent_at else "text",
     })
@@ -451,9 +502,11 @@ def receipt_pending(user_id: int, amount: int, description: str, spent: datetime
         else:
             extra.append(f"⚠️ Chekdagi karta •••• {card_last4} bazada yo'q.")
 
+    description = description or "Chek bo'yicha xarid"
     return {
         "amount": amount,
-        "description": description or "Chek bo'yicha xarid",
+        "description": description,
+        "info": enrich.enrich_local(description).to_dict(),
         "spent_at": spent.strftime("%Y-%m-%d %H:%M"),
         "source": "receipt",
         "suggested_card_id": suggested,
@@ -574,6 +627,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer("Bekor qilindi")
         await query.edit_message_text("❌ Bekor qilindi")
 
+    elif action == "undo":
+        if rest.isdigit() and db.delete_expense(user_id, int(rest)):
+            await query.answer("Bekor qilindi")
+            original = query.message.text_html if query.message and query.message.text else ""
+            await query.edit_message_text("↩️ <b>Bekor qilindi, o'chirildi</b>\n\n<s>" + original.removeprefix("✅ Saqlandi\n") + "</s>")
+        else:
+            await query.answer("Allaqachon o'chirilgan")
+            await query.edit_message_reply_markup(None)
+
     elif action == "del":
         if db.delete_expense(user_id, int(rest)):
             await query.answer("O'chirildi")
@@ -593,7 +655,70 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(reports.month_report(update.effective_user.id, now()))
+    user_id = update.effective_user.id
+    text = reports.month_report(user_id, now())
+    limit = db.get_monthly_limit(user_id)
+    if limit:
+        spent = db.month_total(user_id, now().strftime("%Y-%m"))
+        left = limit - spent
+        text += (f"\n\n🎯 Limit: {format_sum(limit)} — "
+                 + (f"qoldi {format_sum(left)}" if left >= 0 else f"{format_sum(-left)} oshib ketdi"))
+    await update.message.reply_text(text)
+
+
+async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    arg = " ".join(context.args).strip()
+    month = now().strftime("%Y-%m")
+    if not arg:
+        limit = db.get_monthly_limit(user_id)
+        if not limit:
+            await update.message.reply_text(
+                "Oylik limit qo'yilmagan. Masalan: <code>/limit 3 mln</code> yoki <code>/limit 2500000</code>"
+            )
+            return
+        spent = db.month_total(user_id, month)
+        await update.message.reply_text(
+            f"🎯 Oylik limit: {format_sum(limit)}\nShu oy: {format_sum(spent)} ({spent * 100 // limit}%)\n"
+            "O'chirish uchun: <code>/limit 0</code>"
+        )
+        return
+    if arg in ("0", "yo'q", "off"):
+        db.set_monthly_limit(user_id, None)
+        await update.message.reply_text("🎯 Oylik limit o'chirildi.")
+        return
+    parsed = parse_expense(arg)
+    if not parsed or parsed.amount < 1000:
+        await update.message.reply_text("Summani tushunmadim. Masalan: <code>/limit 3 mln</code>")
+        return
+    db.set_monthly_limit(user_id, parsed.amount)
+    db.reset_limit_warnings(user_id, month)
+    spent = db.month_total(user_id, month)
+    await update.message.reply_text(
+        f"🎯 Oylik limit: {format_sum(parsed.amount)}\nShu oy hozircha: {format_sum(spent)} "
+        f"({spent * 100 // parsed.amount}%). 80% va 100% ga yetganda ogohlantiraman."
+    )
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip()
+    if len(query) < 2:
+        await update.message.reply_text("Nimani qidiray? Masalan: <code>/qidir sumka</code>, <code>/qidir Korzinka</code>")
+        return
+    rows, count, total = db.search_expenses(update.effective_user.id, query)
+    if not count:
+        await update.message.reply_text(f"🔎 «{html.escape(query)}» bo'yicha xarajat topilmadi.")
+        return
+    lines = [f"🔎 <b>«{html.escape(query)}»</b>: {count} ta xarajat, jami <b>{format_sum(total)}</b>", ""]
+    for r in rows:
+        details = info_text(r)
+        lines.append(
+            f"• {r['spent_at'][8:10]}.{r['spent_at'][5:7]}.{r['spent_at'][2:4]} — {html.escape(r['description'])} — "
+            f"{format_sum(r['amount'])}" + (f"\n   {details}" if details else "")
+        )
+    if count > len(rows):
+        lines.append(f"\n... va yana {count - len(rows)} ta (to'liq ro'yxat: /export)")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def send_last(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False) -> None:
@@ -628,10 +753,14 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
-    writer.writerow(["Sana", "Izoh", "Summa", "Karta", "Manba"])
+    writer.writerow(["Sana", "Izoh", "Nomi", "Turi", "Brend", "Rang", "Korobka", "Kategoriya",
+                     "Summa", "Karta", "Manba", "Asl matn"])
     for r in rows:
-        writer.writerow([r["spent_at"], r["description"], r["amount"], reports.card_label(r),
-                         "chek" if r["source"] == "receipt" else "matn"])
+        box = {True: "bor", False: "yo'q"}.get(r.get("has_box"), "")
+        writer.writerow([r["spent_at"], r["description"], r.get("item_name") or "", r.get("item_type") or "",
+                         r.get("brand") or "", r.get("color") or "", box, r.get("category") or "",
+                         r["amount"], reports.card_label(r),
+                         "chek" if r["source"] == "receipt" else "matn", r.get("raw_text") or ""])
     # utf-8-sig — Excel o'zbek/kirill harflarini to'g'ri ochishi uchun
     data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
     await update.message.reply_document(data, filename=f"xarajatlar_{now():%Y-%m-%d}.csv")
@@ -660,8 +789,40 @@ async def send_weekly_reports(bot) -> int:
     return sent
 
 
-async def weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_weekly_reports(context.bot)
+async def send_monthly_reports(bot) -> int:
+    """Har oyning 1-kuni o'tgan oy hisobotini yuboradi (har oyga bir marta)."""
+    current = now()
+    last_month = (current.date().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    user_ids = db.all_user_ids()
+    if ALLOWED_USER_IDS:
+        user_ids = [u for u in user_ids if u in ALLOWED_USER_IDS]
+    sent = 0
+    for user_id in user_ids:
+        if not db.mark_report_sent(user_id, f"month:{last_month}"):
+            continue
+        try:
+            await bot.send_message(user_id, reports.previous_month_report(user_id, current))
+            sent += 1
+        except Forbidden:
+            log.info("Foydalanuvchi %s botni bloklagan", user_id)
+        except TelegramError:
+            log.exception("Oylik hisobotni %s ga yuborib bo'lmadi", user_id)
+    return sent
+
+
+async def run_daily_tasks(bot) -> dict:
+    """Har kuni kechqurun chaqiriladi (Vercel Cron yoki lokal job)."""
+    current = now()
+    result = {"weekly_reports_sent": 0, "monthly_reports_sent": 0}
+    if current.weekday() == 6:  # yakshanba
+        result["weekly_reports_sent"] = await send_weekly_reports(bot)
+    if current.day == 1:
+        result["monthly_reports_sent"] = await send_monthly_reports(bot)
+    return result
+
+
+async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_daily_tasks(context.bot)
 
 
 BOT_COMMANDS = [
@@ -671,6 +832,8 @@ BOT_COMMANDS = [
     BotCommand("oxirgi", "Oxirgi 10 ta xarajat"),
     BotCommand("kartalar", "Kartalar ro'yxati"),
     BotCommand("karta", "Karta qo'shish"),
+    BotCommand("qidir", "Xarajatlar ichidan qidirish"),
+    BotCommand("limit", "Oylik limit"),
     BotCommand("export", "CSV (Excel) faylga yuklab olish"),
     BotCommand("ism", "Ism-familiyani o'zgartirish"),
     BotCommand("yordam", "Qo'llanma"),
@@ -707,6 +870,8 @@ def build_application(**builder_options) -> Application:
     app.add_handler(CommandHandler("oy", month_cmd))
     app.add_handler(CommandHandler("oxirgi", last_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("qidir", search_cmd))
+    app.add_handler(CommandHandler("limit", limit_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.Document.PDF, on_receipt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -720,8 +885,7 @@ def main() -> None:
     db.init()
     app = build_application(post_init=post_init, post_shutdown=post_shutdown)
     if app.job_queue:
-        # PTB'da kunlar: 0 = yakshanba, 1 = dushanba, ... 6 = shanba
-        app.job_queue.run_daily(weekly_job, time=WEEKLY_REPORT_TIME, days=(0,), name="weekly_report")
+        app.job_queue.run_daily(daily_job, time=WEEKLY_REPORT_TIME, name="daily_tasks")
     log.info("Bot ishga tushdi (polling)")
     # Vercel'da webhook o'rnatilgan bo'lsa, polling uni o'chirib yuboradi
     app.run_polling(allowed_updates=Update.ALL_TYPES)
