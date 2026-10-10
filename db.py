@@ -56,6 +56,21 @@ ALTER TABLE expenses ADD COLUMN IF NOT EXISTS color     TEXT;
 ALTER TABLE expenses ADD COLUMN IF NOT EXISTS has_box   BOOLEAN;  -- korobka bilan / korobkasiz / NULL
 ALTER TABLE expenses ADD COLUMN IF NOT EXISTS category  TEXT;
 ALTER TABLE users    ADD COLUMN IF NOT EXISTS monthly_limit BIGINT;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS store         TEXT;   -- chekdagi do'kon (soliq.uz)
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS receipt_items JSONB;  -- chekdagi mahsulotlar (soliq.uz)
+-- soliq.uz faqat O'zbekistondan ochiladi: Vercel vazifa qo'yadi, kompyuterdagi soliq_worker.py bajaradi
+CREATE TABLE IF NOT EXISTS soliq_jobs (
+    id         BIGSERIAL PRIMARY KEY,
+    qr_url     TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'new',   -- new / working / ok / pending / error
+    result     JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS worker_status (
+    name      TEXT PRIMARY KEY,
+    last_seen TIMESTAMPTZ NOT NULL
+);
 -- Tugma bosilishini kutayotgan xarajatlar va suhbat holati (serverless'da xotira saqlanmaydi)
 CREATE TABLE IF NOT EXISTS user_state (
     user_id BIGINT PRIMARY KEY,
@@ -74,13 +89,16 @@ ALTER TABLE cards        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expenses     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_state   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sent_reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE soliq_jobs   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worker_status ENABLE ROW LEVEL SECURITY;
 -- Supabase Table Editor'da qulay ko'rish uchun: xarajatlar ism-familiya va karta bilan
 CREATE OR REPLACE VIEW xarajatlar WITH (security_invoker = true) AS
 SELECT e.id, e.user_id, u.full_name, e.spent_at, e.description, e.amount,
        c.name AS karta, c.last4, c.holder_name AS karta_egasi, e.source,
        e.item_name AS nomi, e.item_type AS turi, e.brand AS brend, e.color AS rang,
        CASE e.has_box WHEN true THEN 'bor' WHEN false THEN 'yo''q' END AS korobka,
-       e.category AS kategoriya, e.raw_text AS asl_matn
+       e.category AS kategoriya, e.raw_text AS asl_matn,
+       e.store AS dokon, e.receipt_items AS chek_mahsulotlari
 FROM expenses e
 LEFT JOIN users u ON u.user_id = e.user_id
 LEFT JOIN cards c ON c.id = e.card_id;
@@ -243,16 +261,18 @@ def delete_card(user_id: int, card_id: int) -> bool:
 def add_expense(
     user_id: int, amount: int, description: str, card_id: int | None, spent_at: str, source: str,
     info: dict | None = None, raw_text: str | None = None,
+    store: str | None = None, receipt_items: list | None = None,
 ) -> int:
     """info — enrich.ItemInfo.to_dict(): item_name, item_type, brand, color, has_box, category."""
     info = info or {}
     row = _execute(
         "INSERT INTO expenses (user_id, amount, description, card_id, spent_at, source, created_at,"
-        " raw_text, item_name, item_type, brand, color, has_box, category)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        " raw_text, item_name, item_type, brand, color, has_box, category, store, receipt_items)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (user_id, amount, description, card_id, spent_at, source, _now(), raw_text,
          info.get("item_name"), info.get("item_type"), info.get("brand"), info.get("color"),
-         info.get("has_box"), info.get("category")),
+         info.get("has_box"), info.get("category"), store,
+         json.dumps(receipt_items, ensure_ascii=False) if receipt_items else None),
     ).fetchone()
     return row["id"]
 
@@ -348,3 +368,50 @@ def mark_report_sent(user_id: int, period: str) -> bool:
         (user_id, period),
     ).fetchone()
     return row is not None
+
+
+# --- soliq.uz navbati ---
+
+def soliq_worker_alive(max_age_seconds: int = 60) -> bool:
+    row = _execute(
+        "SELECT last_seen > now() - make_interval(secs => %s) AS alive FROM worker_status WHERE name = 'soliq'",
+        (max_age_seconds,),
+    ).fetchone()
+    return bool(row and row["alive"])
+
+
+def soliq_heartbeat() -> None:
+    _execute(
+        "INSERT INTO worker_status (name, last_seen) VALUES ('soliq', now())"
+        " ON CONFLICT (name) DO UPDATE SET last_seen = now()"
+    )
+
+
+def enqueue_soliq_job(qr_url: str) -> int:
+    row = _execute("INSERT INTO soliq_jobs (qr_url) VALUES (%s) RETURNING id", (qr_url,)).fetchone()
+    _execute("NOTIFY soliq_jobs")  # kompyuterdagi yordamchi darhol uyg'onadi
+    return row["id"]
+
+
+def get_soliq_job(job_id: int) -> dict | None:
+    return _execute("SELECT status, result FROM soliq_jobs WHERE id = %s", (job_id,)).fetchone()
+
+
+def claim_soliq_job() -> dict | None:
+    """Eng eski yangi vazifani oladi (2 daqiqadan eskisi endi kerak emas — bot kutmaydi)."""
+    return _execute(
+        "UPDATE soliq_jobs SET status = 'working', updated_at = now() WHERE id = ("
+        " SELECT id FROM soliq_jobs WHERE status = 'new' AND created_at > now() - interval '2 minutes'"
+        " ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, qr_url"
+    ).fetchone()
+
+
+def finish_soliq_job(job_id: int, status: str, result: dict | None) -> None:
+    _execute(
+        "UPDATE soliq_jobs SET status = %s, result = %s, updated_at = now() WHERE id = %s",
+        (status, json.dumps(result, ensure_ascii=False) if result else None, job_id),
+    )
+
+
+def cleanup_soliq_jobs() -> None:
+    _execute("DELETE FROM soliq_jobs WHERE created_at < now() - interval '1 day'")

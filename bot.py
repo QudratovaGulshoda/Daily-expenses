@@ -47,9 +47,10 @@ ALLOWED_USER_IDS = {
 }
 # Claude faqat QR-kodsiz cheklar uchun ishlatiladi va faqat kalit berilgan bo'lsa (pullik)
 CLAUDE_ENABLED = bool(os.getenv("ANTHROPIC_API_KEY"))
-# Chek summasini soliq.uz dan olish. O'chiq bo'lsa (standart) bot hech qayerga murojaat qilmaydi:
-# QR-koddan faqat sanani oladi, summani foydalanuvchi o'zi yozadi.
-SOLIQ_LOOKUP = os.getenv("SOLIQ_LOOKUP", "false").strip().lower() in ("1", "true", "yes", "ha")
+# Chek ma'lumotini soliq.uz dan olish. soliq.uz faqat O'zbekistondan ochiladi, shuning uchun uni
+# kompyuterdagi soliq_worker.py bajaradi; u ishlamayotgan bo'lsa summa chek rasmidan (OCR) o'qiladi.
+SOLIQ_LOOKUP = os.getenv("SOLIQ_LOOKUP", "true").strip().lower() in ("1", "true", "yes", "ha")
+SOLIQ_WAIT_SECONDS = float(os.getenv("SOLIQ_WAIT_SECONDS", "20"))
 # Haftalik hisobot vaqti: yakshanba, 21:00 (o'zgartirish mumkin)
 WEEKLY_REPORT_TIME = time(
     int(os.getenv("WEEKLY_REPORT_HOUR", "21")), int(os.getenv("WEEKLY_REPORT_MINUTE", "0")), tzinfo=TZ
@@ -72,7 +73,8 @@ Visa 4111 1111 1111 4444</code>
 Bot qaysi kartadan to'langanini so'raydi — tugmani bosing yoki oxirgi 4 raqamni yozing.
 
 <b>3. Chek tashlang</b>
-Chekning rasmini yuboring — bot JAMI summasini o'qiydi, sanani QR-koddan oladi.
+Chekning rasmini yuboring — bot soliq.uz dan summa, do'kon va mahsulotlarni oladi
+(bo'lmasa JAMI summasini rasmdan o'qiydi).
 Rasmga izoh yozsangiz (masalan <code>Qo'zi go'shti</code>), xarajat shu nom bilan saqlanadi.
 "JAMI" qatori va QR-kod aniq ko'rinsin (tekis, yorug' joyda rasmga oling).
 
@@ -377,6 +379,7 @@ async def finalize(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: in
     expense_id = db.add_expense(
         user_id, p["amount"], p["description"], card_id, p["spent_at"], p["source"],
         info=p.get("info"), raw_text=p.get("raw_text"),
+        store=p.get("store"), receipt_items=p.get("receipt_items"),
     )
     if context.user_data.get("last_pending") == pid:
         context.user_data.pop("last_pending", None)
@@ -481,6 +484,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     })
 
 
+async def lookup_soliq(qr_url: str) -> tuple[soliq.SoliqReceipt | None, str]:
+    """Chekni soliq.uz dan olish: vazifani navbatga qo'yib, yordamchining javobini kutadi.
+
+    Sabab: "ok", "off" (o'chirilgan), "offline" (yordamchi ishlamayapti), "pending" (chek hali
+    soliq bazasiga tushmagan), "timeout" yoki "error".
+    """
+    if not SOLIQ_LOOKUP:
+        return None, "off"
+    if not db.soliq_worker_alive():
+        return None, "offline"
+    job_id = db.enqueue_soliq_job(qr_url)
+    deadline = asyncio.get_running_loop().time() + SOLIQ_WAIT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.7)
+        job = db.get_soliq_job(job_id)
+        if job and job["status"] == "ok":
+            return soliq.SoliqReceipt.from_dict(job["result"]), "ok"
+        if job and job["status"] in ("pending", "error"):
+            return None, job["status"]
+    return None, "timeout"
+
+
 def receipt_pending(user_id: int, amount: int, description: str, spent: datetime | None,
                     items: list[dict], card_last4: str = "") -> dict:
     """Chekdan olingan ma'lumotdan kutilayotgan xarajat yasaydi."""
@@ -505,10 +530,13 @@ def receipt_pending(user_id: int, amount: int, description: str, spent: datetime
             extra.append(f"⚠️ Chekdagi karta •••• {card_last4} bazada yo'q.")
 
     description = description or "Chek bo'yicha xarid"
+    info = enrich.enrich_local(description).to_dict()
+    if info["category"] == "Boshqa" and items:
+        info["category"] = enrich.items_category(items)
     return {
         "amount": amount,
         "description": description,
-        "info": enrich.enrich_local(description).to_dict(),
+        "info": info,
         "spent_at": spent.strftime("%Y-%m-%d %H:%M"),
         "source": "receipt",
         "suggested_card_id": suggested,
@@ -542,15 +570,24 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     qr_url = await asyncio.to_thread(soliq.extract_qr_url, data) if is_image else None
     receipt_date = soliq.date_from_qr(qr_url) if qr_url else None
 
-    # 1) soliq.uz (faqat SOLIQ_LOOKUP yoqilgan bo'lsa)
+    # 1) soliq.uz (kompyuterdagi yordamchi orqali)
     reason = "off"
-    if qr_url and SOLIQ_LOOKUP:
+    if qr_url:
         await status.edit_text("⏳ QR-kod topildi, soliq.uz dan ma'lumot olinmoqda...")
-        r, reason = await soliq.fetch_receipt(qr_url)
+        r, reason = await lookup_soliq(qr_url)
         if r:
-            await ask_card(update, context, receipt_pending(
-                user_id, r.total, caption or r.store, r.spent_at, r.items
-            ), reply_to=status)
+            amount = caption_parsed.amount if caption_parsed else r.total
+            description = (caption_parsed.description if caption_parsed else caption) or r.store
+            p = receipt_pending(user_id, amount, description, r.spent_at, r.items)
+            p["raw_text"] = caption or None
+            p["store"] = r.store or None
+            p["receipt_items"] = r.items
+            paid = "💳 Chekda: karta orqali to'langan" if r.card and not r.cash else (
+                "💵 Chekda: naqd to'langan" if r.cash and not r.card else "")
+            p["extra"] = "\n".join(filter(None, [
+                f"🏪 {html.escape(r.store)}" if r.store else "", p.get("extra"), paid, "✅ soliq.uz dan olindi",
+            ]))
+            await ask_card(update, context, p, reply_to=status)
             return
 
     # 2) Tekin: chekdagi yozuvni o'qib, JAMI summasini topish (internetsiz)
@@ -564,7 +601,11 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         p = receipt_pending(user_id, amount, description, receipt_date, [])
         p["raw_text"] = caption or None
         if not caption_parsed:
-            note = "🔍 Summa chekdan o'qildi. Noto'g'ri bo'lsa ❌ Bekor qiling va summani yozing."
+            note = "🔍 Summa chek rasmidan o'qildi. Noto'g'ri bo'lsa ❌ Bekor qiling va summani yozing."
+            if qr_url and reason in ("offline", "timeout"):
+                note += "\nℹ️ soliq.uz yordamchisi hozir ishlamayapti (kompyuter o'chiq), shuning uchun mahsulotlar ro'yxati yo'q."
+            elif reason == "pending":
+                note += "\nℹ️ Chek hali soliq bazasiga tushmagan (48 soatgacha vaqt oladi)."
             if not caption:
                 note += "\n💡 Keyingi safar rasmga izoh yozing (masalan «Qo'zi go'shti») — nomi shunday saqlanadi."
             p["extra"] = "\n".join(filter(None, [p.get("extra"), note]))
@@ -598,6 +639,8 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         why = {
             "pending": " Chek hali soliq bazasiga tushmagan (bu 48 soatgacha vaqt oladi).",
             "error": " soliq.uz dan ma'lumot olib bo'lmadi.",
+            "offline": " soliq.uz yordamchisi hozir ishlamayapti (kompyuter o'chiq).",
+            "timeout": " soliq.uz javob bermadi.",
         }.get(reason, "")
         await status.edit_text(
             f"📷 Chek sanasi: <b>{spent:%d.%m.%Y}</b>, lekin summani o'qiy olmadim.{why}\n"

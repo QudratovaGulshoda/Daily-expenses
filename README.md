@@ -36,7 +36,7 @@ webhook'ni o'chirib qo'yadi — keyin `setup_webhook.py` ni qayta ishga tushirin
 | Kartalarni qo'shish | `/karta`, keyin har qatorga bitta: `Humo Kapitalbank 9860 1234 5678 9012` (oxirgi 4 raqami bir xil kartalar nomi bilan ajratiladi) |
 | Xarajat yozish | `Polene sumka 500000`, `Polene sumka 500 ming`, `Taksi 25k`, `kecha telefon 1 mln 200 ming` |
 | Kartani tanlash | Tugmani bosing yoki oxirgi 4 raqamni yozing (`9012`); shunday kartalar bir nechta bo'lsa bot qaysi biri ekanini so'raydi. Naqd bo'lsa `naqd` |
-| Chek | Chek rasmini yuboring — JAMI summasi o'qiladi, sana QR-koddan olinadi; rasmga izoh yozsangiz, u xarajat nomi bo'ladi |
+| Chek | Chek rasmini yuboring — soliq.uz dan summa, do'kon va mahsulotlar olinadi (bo'lmasa JAMI rasmdan o'qiladi); rasmga izoh yozsangiz, u xarajat nomi bo'ladi |
 | Hisobotlar | `/bugun`, `/hafta`, `/oy` |
 | Tahrirlash | Saqlangandan keyin "↩️ Bekor qilish" tugmasi; `/oxirgi` — oxirgi 10 ta, 🗑 bilan o'chirish |
 | Qidiruv | `/qidir sumka`, `/qidir Korzinka`, `/qidir qora` — topilganlar va jami summa |
@@ -70,19 +70,30 @@ yakshanba — haftalik hisobot, oyning 1-kuni — o'tgan oy hisoboti (kategoriya
 
 ## Chek qanday o'qiladi
 
-1. **QR-kod** (`soliq.py`) — chek sanasi (internetsiz).
-2. **OCR** (`ocr.py`, RapidOCR) — chekdagi yozuv server ichida o'qiladi va **JAMI** summasi topiladi
-   (QQS, chegirma va foizli qatorlar hisobga olinmaydi). Tekin, hech qayerga yuborilmaydi.
-3. Rasmga izoh yozilsa (`Qo'zi go'shti`), xarajat shu nom bilan saqlanadi; izohda summa bo'lsa
-   (`Qo'zi go'shti 80 ming`), o'sha summa olinadi.
-4. Summa topilmasa, bot sanani eslab qolib, summani yozishni so'raydi.
+1. **QR-kod** (`soliq.py`) o'qiladi.
+2. **soliq.uz** — summa, do'kon, mahsulotlar va to'lov turi olinadi. soliq.uz **faqat O'zbekistondan
+   ochiladi** (Vercel'ning hamma regionlari bloklangan), shuning uchun buni O'zbekistondagi kompyuterda
+   ishlaydigan `soliq_worker.py` bajaradi: bot vazifani Supabase'dagi `soliq_jobs` ga yozadi, yordamchi
+   uni darhol oladi (LISTEN/NOTIFY), sahifani yashirin Chromium'da ochib, natijani qaytaradi (~3–5 soniya).
+3. Yordamchi ishlamayotgan bo'lsa (kompyuter o'chiq/uxlab yotibdi) yoki chek hali soliq bazasiga
+   tushmagan bo'lsa — **OCR** (`ocr.py`): JAMI summasi chek rasmidan o'qiladi (tekin, internetsiz).
+4. Rasmga izoh yozilsa (`Uyga bozorlik`), xarajat shu nom bilan saqlanadi; izohda summa bo'lsa, o'sha olinadi.
+5. Hech narsa topilmasa, bot sanani eslab qolib, summani yozishni so'raydi.
 
-Ixtiyoriy sozlamalar (`.env` da):
-- `ANTHROPIC_API_KEY=...` — OCR summani topa olmagan cheklar (Payme/Click skrinshotlari, PDF) Claude orqali o'qiladi (pullik).
-- `SOLIQ_LOOKUP=true` — summa, do'kon va mahsulotlar ofd.soliq.uz dan olinadi (yashirin Chromium orqali,
-  **faqat kompyuterda**, Vercel'da ishlamaydi: `pip install playwright && python -m playwright install chromium`).
+`ANTHROPIC_API_KEY=...` berilsa, OCR ham o'qiy olmagan cheklar Claude orqali o'qiladi (pullik).
 
-Fiskal chekda karta raqami bo'lmaydi, shuning uchun bot qaysi kartadan to'langanini baribir so'raydi.
+### Yordamchini kompyuterda ishga tushirish (macOS)
+
+```bash
+.venv/bin/pip install playwright && .venv/bin/python -m playwright install chromium
+# kompyuter yoqilganda o'zi ishga tushishi uchun:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/uz.hisobkitob.soliq-worker.plist
+# to'xtatish:
+launchctl bootout gui/$(id -u)/uz.hisobkitob.soliq-worker
+```
+
+Log: `soliq_worker.log`. Plist namunasi `deploy/uz.hisobkitob.soliq-worker.plist` da.
+Kompyuter uxlab qolsa yordamchi ham to'xtaydi — bot bu vaqtda OCR bilan ishlaydi.
 
 Serverda OCR ishlayotganini tekshirish: `curl -H "Authorization: Bearer $CRON_SECRET" https://<loyiha>.vercel.app/api/selftest`
 
@@ -90,7 +101,7 @@ Serverda OCR ishlayotganini tekshirish: `curl -H "Authorization: Bearer $CRON_SE
 
 - `users` — Telegram ID, ism-familiya, Telegram username
 - `cards` — kartalar (nomi, oxirgi 4 raqami, egasining ism-familiyasi)
-- `xarajatlar` (view) — hamma xarajatlar ism-familiya, karta, nomi, turi, brendi, rangi, korobkasi va kategoriyasi bilan
+- `xarajatlar` (view) — hamma xarajatlar ism-familiya, karta, nomi, turi, brendi, rangi, korobkasi, kategoriyasi, do'koni va chekdagi mahsulotlari bilan
 
 ## Xavfsizlik
 
@@ -107,6 +118,7 @@ xabarni bot chatdan o'chiradi. To'liq karta raqamini saqlash xavfli va hisob-kit
 - `enrich.py` — imlo tuzatish; nomi, turi, brendi, rangi, korobkasi, kategoriyasini ajratish
 - `soliq.py` — QR-kodni o'qish; ixtiyoriy ravishda soliq.uz dan chek ma'lumotini olish
 - `ocr.py` — chekdagi yozuvni o'qib, JAMI summasini topish (tekin, internetsiz)
+- `soliq_worker.py` — O'zbekistondagi kompyuterda ishlaydigan soliq.uz yordamchisi
 - `receipt.py` — QR'siz cheklarni Claude orqali o'qish (ixtiyoriy, pullik)
 - `reports.py` — kunlik / haftalik / oylik hisobotlar
 - `db.py` — Postgres (Supabase) baza

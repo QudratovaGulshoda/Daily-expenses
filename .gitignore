@@ -5,3 +5,4 @@ bot_state.pickle
 __pycache__/
 bot.log
 .vercel
+soliq_worker.log

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>uz.hisobkitob.soliq-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/PATH/TO/Hisob-kitob/.venv/bin/python</string>
+        <string>/PATH/TO/Hisob-kitob/soliq_worker.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>/PATH/TO/Hisob-kitob</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>/PATH/TO/Hisob-kitob/soliq_worker.log</string>
+    <key>StandardErrorPath</key><string>/PATH/TO/Hisob-kitob/soliq_worker.log</string>
+</dict>
+</plist>

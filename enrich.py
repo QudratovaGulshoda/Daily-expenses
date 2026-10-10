@@ -327,6 +327,16 @@ def enrich_local(text: str) -> ItemInfo:
     )
 
 
+def items_category(items: list[dict]) -> str:
+    """Chekdagi mahsulotlar bo'yicha eng ko'p pul ketgan kategoriya."""
+    totals: dict[str, int] = {}
+    for item in items:
+        category = enrich_local(f"{item.get('name', '')} {item.get('product', '')}").category
+        if category != "Boshqa":
+            totals[category] = totals.get(category, 0) + int(item.get("amount") or 0)
+    return max(totals, key=totals.get) if totals else "Boshqa"
+
+
 # --- Claude (ixtiyoriy) ---
 
 MODEL = "claude-opus-5-5"

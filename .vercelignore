@@ -6,3 +6,4 @@ bot.log
 *.pickle
 deploy/
 setup_webhook.py
+soliq_worker.py
