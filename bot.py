@@ -29,6 +29,7 @@ from telegram.ext import (
 
 import db
 import enrich
+import ocr
 import reports
 from parser import contains_full_card_number, format_sum, parse_card_line, parse_expense
 import soliq
@@ -71,8 +72,9 @@ Visa 4111 1111 1111 4444</code>
 Bot qaysi kartadan to'langanini so'raydi — tugmani bosing yoki oxirgi 4 raqamni yozing.
 
 <b>3. Chek tashlang</b>
-Chekning rasmini yuboring — bot QR-koddan chek sanasini oladi, siz summani yozasiz.
-QR-kod aniq ko'rinsin (yaqinroqdan, tekis qilib rasmga oling).
+Chekning rasmini yuboring — bot JAMI summasini o'qiydi, sanani QR-koddan oladi.
+Rasmga izoh yozsangiz (masalan <code>Qo'zi go'shti</code>), xarajat shu nom bilan saqlanadi.
+"JAMI" qatori va QR-kod aniq ko'rinsin (tekis, yorug' joyda rasmga oling).
 
 <b>Buyruqlar</b>
 /bugun — bugungi xarajatlar
@@ -529,63 +531,84 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         tg_file = await doc.get_file()
 
+    # Rasm izohi: "Qo'zi go'shti" — xarajat nomi, "Qo'zi go'shti 78 ming" — nomi va summasi
+    caption = (message.caption or "").strip()
+    caption_parsed = parse_expense(caption) if caption else None
+
     status = await message.reply_text("⏳ Chek o'qilmoqda...")
     data = bytes(await tg_file.download_as_bytearray())
+    is_image = media_type != "application/pdf"
 
-    # 1) Tekin yo'l: fiskal chekdagi QR-kod (soliq.uz ga faqat SOLIQ_LOOKUP yoqilgan bo'lsa murojaat qilinadi)
-    if media_type != "application/pdf":
-        qr_url = await asyncio.to_thread(soliq.extract_qr_url, data)
-        if qr_url:
-            reason = "off"
-            if SOLIQ_LOOKUP:
-                await status.edit_text("⏳ QR-kod topildi, soliq.uz dan ma'lumot olinmoqda...")
-                r, reason = await soliq.fetch_receipt(qr_url)
-                if r:
-                    await ask_card(update, context, receipt_pending(
-                        user_id, r.total, r.store, r.spent_at, r.items
-                    ), reply_to=status)
-                    return
-            if not CLAUDE_ENABLED:
-                spent = soliq.date_from_qr(qr_url) or now()
-                context.user_data["receipt_spent_at"] = spent.strftime("%Y-%m-%d %H:%M")
-                why = {
-                    "off": "",
-                    "pending": ", lekin chek hali soliq bazasiga tushmagan (bu 48 soatgacha vaqt oladi)",
-                }.get(reason, ", lekin soliq.uz dan ma'lumot olib bo'lmadi")
-                await status.edit_text(
-                    f"📷 Chek sanasi: <b>{spent:%d.%m.%Y}</b>{why}.\n"
-                    "Summani yozing — shu sana bilan saqlanadi, masalan: <code>Korzinka 345000</code>"
-                )
-                return
+    qr_url = await asyncio.to_thread(soliq.extract_qr_url, data) if is_image else None
+    receipt_date = soliq.date_from_qr(qr_url) if qr_url else None
 
-    # 2) Pullik yo'l: Claude (faqat ANTHROPIC_API_KEY bo'lsa)
-    if not CLAUDE_ENABLED:
+    # 1) soliq.uz (faqat SOLIQ_LOOKUP yoqilgan bo'lsa)
+    reason = "off"
+    if qr_url and SOLIQ_LOOKUP:
+        await status.edit_text("⏳ QR-kod topildi, soliq.uz dan ma'lumot olinmoqda...")
+        r, reason = await soliq.fetch_receipt(qr_url)
+        if r:
+            await ask_card(update, context, receipt_pending(
+                user_id, r.total, caption or r.store, r.spent_at, r.items
+            ), reply_to=status)
+            return
+
+    # 2) Tekin: chekdagi yozuvni o'qib, JAMI summasini topish (internetsiz)
+    total, store = None, None
+    if is_image and not caption_parsed:
+        await status.edit_text("⏳ Chekdagi summa o'qilmoqda...")
+        total, store = await asyncio.to_thread(ocr.read_receipt_total, data)
+    amount = caption_parsed.amount if caption_parsed else total
+    if amount:
+        description = (caption_parsed.description if caption_parsed else caption) or store or "Chek bo'yicha xarid"
+        p = receipt_pending(user_id, amount, description, receipt_date, [])
+        p["raw_text"] = caption or None
+        if not caption_parsed:
+            note = "🔍 Summa chekdan o'qildi. Noto'g'ri bo'lsa ❌ Bekor qiling va summani yozing."
+            if not caption:
+                note += "\n💡 Keyingi safar rasmga izoh yozing (masalan «Qo'zi go'shti») — nomi shunday saqlanadi."
+            p["extra"] = "\n".join(filter(None, [p.get("extra"), note]))
+        await ask_card(update, context, p, reply_to=status)
+        return
+
+    # 3) Pullik: Claude (faqat ANTHROPIC_API_KEY bo'lsa)
+    if CLAUDE_ENABLED:
+        try:
+            r = await read_receipt(data, media_type)
+        except ReceiptError as e:
+            r = None
+            log.warning("Claude chekni o'qiy olmadi: %s", e)
+        except Exception:
+            r = None
+            log.exception("Chekni o'qishda xato")
+        if r and r.is_receipt and r.total > 0:
+            try:
+                spent = datetime.combine(datetime.strptime(r.date, "%Y-%m-%d").date(), now().time())
+            except ValueError:
+                spent = receipt_date
+            await ask_card(update, context, receipt_pending(
+                user_id, r.total, caption or r.summary or r.store, spent, r.items, r.card_last4
+            ), reply_to=status)
+            return
+
+    # 4) Summani topib bo'lmadi — foydalanuvchidan so'raymiz
+    if qr_url:
+        spent = receipt_date or now()
+        context.user_data["receipt_spent_at"] = spent.strftime("%Y-%m-%d %H:%M")
+        why = {
+            "pending": " Chek hali soliq bazasiga tushmagan (bu 48 soatgacha vaqt oladi).",
+            "error": " soliq.uz dan ma'lumot olib bo'lmadi.",
+        }.get(reason, "")
         await status.edit_text(
-            "🤔 Chekda QR-kod topilmadi.\n"
-            "QR-kodni yaqinroqdan, tekis va yorug' joyda rasmga oling yoki xarajatni matn bilan yozing."
+            f"📷 Chek sanasi: <b>{spent:%d.%m.%Y}</b>, lekin summani o'qiy olmadim.{why}\n"
+            "Summani yozing — shu sana bilan saqlanadi, masalan: <code>Korzinka 345000</code>"
         )
         return
-    try:
-        r = await read_receipt(data, media_type)
-    except ReceiptError as e:
-        await status.edit_text(f"⚠️ {e}")
-        return
-    except Exception:
-        log.exception("Chekni o'qishda xato")
-        await status.edit_text("⚠️ Chekni o'qishda xato yuz berdi. Xarajatni matn bilan yozing.")
-        return
-    if not r.is_receipt or r.total <= 0:
-        await status.edit_text(
-            "🤔 Bu rasmda chek yoki to'lov summasini topa olmadim. Xarajatni matn bilan yozing."
-        )
-        return
-    try:
-        spent = datetime.combine(datetime.strptime(r.date, "%Y-%m-%d").date(), now().time())
-    except ValueError:
-        spent = None
-    await ask_card(update, context, receipt_pending(
-        user_id, r.total, r.summary or r.store, spent, r.items, r.card_last4
-    ), reply_to=status)
+    await status.edit_text(
+        "🤔 Chekdan summani o'qiy olmadim.\n"
+        "Chekni tekis, yorug' joyda, \"JAMI\" qatori aniq ko'rinadigan qilib rasmga oling — "
+        "yoki xarajatni matn bilan yozing."
+    )
 
 
 # --- Tugmalar ---

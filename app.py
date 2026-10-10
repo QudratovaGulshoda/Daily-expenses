@@ -65,3 +65,27 @@ async def daily_cron(request: Request):
     application = await get_application()
     result = await bot.run_daily_tasks(application.bot)  # yakshanba — haftalik, 1-kun — oylik hisobot
     return {"ok": True, **result}
+
+
+@app.get("/api/selftest")
+async def selftest(request: Request):
+    """Serverda OCR va baza ishlayotganini tekshirish (CRON_SECRET bilan)."""
+    if not _secret_ok(request.headers.get("authorization", ""),
+                      "Bearer " + os.getenv("CRON_SECRET", "") if os.getenv("CRON_SECRET") else ""):
+        return Response(status_code=401)
+    import io
+    import time
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    import ocr
+
+    img = Image.new("RGB", (700, 160), "white")
+    draw = ImageDraw.Draw(img)
+    draw.text((30, 50), "JAMI =78'485.00", fill="black", font=ImageFont.load_default(size=48))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG")
+    started = time.time()
+    total, _ = await asyncio.to_thread(ocr.read_receipt_total, buf.getvalue())
+    db.ping()
+    return {"ok": total == 78485, "ocr_total": total, "ocr_seconds": round(time.time() - started, 2)}

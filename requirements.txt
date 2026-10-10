@@ -5,7 +5,10 @@ python-dotenv>=1.0
 tzdata
 # Chekdagi QR-kodni o'qish (tekin, internetsiz)
 zxing-cpp>=3.0
-pillow>=10
+pillow>=10.1
+# Chekdagi JAMI summasini o'qish (tekin, internetsiz OCR)
+rapidocr>=3.0
+onnxruntime>=1.18
 # Ixtiyoriy: QR-kodsiz cheklarni o'qish uchun (pullik, ANTHROPIC_API_KEY kerak)
 anthropic>=1.11
 # soliq.uz dan summani olish (SOLIQ_LOOKUP=true) faqat kompyuterda ishlaydi, Vercel'da emas:

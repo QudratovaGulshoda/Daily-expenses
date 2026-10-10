@@ -36,7 +36,7 @@ webhook'ni o'chirib qo'yadi — keyin `setup_webhook.py` ni qayta ishga tushirin
 | Kartalarni qo'shish | `/karta`, keyin har qatorga bitta: `Humo Kapitalbank 9860 1234 5678 9012` (oxirgi 4 raqami bir xil kartalar nomi bilan ajratiladi) |
 | Xarajat yozish | `Polene sumka 500000`, `Polene sumka 500 ming`, `Taksi 25k`, `kecha telefon 1 mln 200 ming` |
 | Kartani tanlash | Tugmani bosing yoki oxirgi 4 raqamni yozing (`9012`); shunday kartalar bir nechta bo'lsa bot qaysi biri ekanini so'raydi. Naqd bo'lsa `naqd` |
-| Chek | Chek rasmini yuboring — QR-koddan sana olinadi, summani o'zingiz yozasiz |
+| Chek | Chek rasmini yuboring — JAMI summasi o'qiladi, sana QR-koddan olinadi; rasmga izoh yozsangiz, u xarajat nomi bo'ladi |
 | Hisobotlar | `/bugun`, `/hafta`, `/oy` |
 | Tahrirlash | Saqlangandan keyin "↩️ Bekor qilish" tugmasi; `/oxirgi` — oxirgi 10 ta, 🗑 bilan o'chirish |
 | Qidiruv | `/qidir sumka`, `/qidir Korzinka`, `/qidir qora` — topilganlar va jami summa |
@@ -70,17 +70,21 @@ yakshanba — haftalik hisobot, oyning 1-kuni — o'tgan oy hisoboti (kategoriya
 
 ## Chek qanday o'qiladi
 
-Standart holatda bot **hech qayerga murojaat qilmaydi**: chekdagi QR-koddan faqat sanani
-o'qiydi (bot o'zi, tashqi xizmatlarsiz), summani esa siz yozasiz.
+1. **QR-kod** (`soliq.py`) — chek sanasi (internetsiz).
+2. **OCR** (`ocr.py`, RapidOCR) — chekdagi yozuv server ichida o'qiladi va **JAMI** summasi topiladi
+   (QQS, chegirma va foizli qatorlar hisobga olinmaydi). Tekin, hech qayerga yuborilmaydi.
+3. Rasmga izoh yozilsa (`Qo'zi go'shti`), xarajat shu nom bilan saqlanadi; izohda summa bo'lsa
+   (`Qo'zi go'shti 80 ming`), o'sha summa olinadi.
+4. Summa topilmasa, bot sanani eslab qolib, summani yozishni so'raydi.
 
 Ixtiyoriy sozlamalar (`.env` da):
-- `SOLIQ_LOOKUP=true` — summa, do'kon va mahsulotlar ofd.soliq.uz ning ochiq chek tekshirish
-  sahifasidan avtomatik olinadi (yashirin Chromium orqali, **faqat kompyuterda**, Vercel'da ishlamaydi:
-  `pip install playwright && python -m playwright install chromium`). Yangi chek soliq bazasiga
-  48 soatgacha kechikib tushishi mumkin.
-- `ANTHROPIC_API_KEY=...` — QR-kodsiz cheklar (Payme/Click skrinshotlari, PDF) Claude orqali o'qiladi (pullik).
+- `ANTHROPIC_API_KEY=...` — OCR summani topa olmagan cheklar (Payme/Click skrinshotlari, PDF) Claude orqali o'qiladi (pullik).
+- `SOLIQ_LOOKUP=true` — summa, do'kon va mahsulotlar ofd.soliq.uz dan olinadi (yashirin Chromium orqali,
+  **faqat kompyuterda**, Vercel'da ishlamaydi: `pip install playwright && python -m playwright install chromium`).
 
 Fiskal chekda karta raqami bo'lmaydi, shuning uchun bot qaysi kartadan to'langanini baribir so'raydi.
+
+Serverda OCR ishlayotganini tekshirish: `curl -H "Authorization: Bearer $CRON_SECRET" https://<loyiha>.vercel.app/api/selftest`
 
 ## Supabase'da ko'rish
 
@@ -102,6 +106,7 @@ xabarni bot chatdan o'chiradi. To'liq karta raqamini saqlash xavfli va hisob-kit
 - `parser.py` — matndan summa / izoh / karta raqamini ajratish
 - `enrich.py` — imlo tuzatish; nomi, turi, brendi, rangi, korobkasi, kategoriyasini ajratish
 - `soliq.py` — QR-kodni o'qish; ixtiyoriy ravishda soliq.uz dan chek ma'lumotini olish
+- `ocr.py` — chekdagi yozuvni o'qib, JAMI summasini topish (tekin, internetsiz)
 - `receipt.py` — QR'siz cheklarni Claude orqali o'qish (ixtiyoriy, pullik)
 - `reports.py` — kunlik / haftalik / oylik hisobotlar
 - `db.py` — Postgres (Supabase) baza
